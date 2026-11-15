@@ -1,0 +1,102 @@
+name: Build A02q kernel (msm8953-mainline 7.1.3)
+
+on:
+  workflow_dispatch:
+
+env:
+  # Значения для mkbootimg. Для Samsung A02s их нужно сверить
+  # со стоковым boot.img (см. unpackbootimg или magiskboot unpack).
+  BASE: "0x80000000"
+  KERNEL_OFFSET: "0x00008000"
+  RAMDISK_OFFSET: "0x01000000"
+  TAGS_OFFSET: "0x00000100"
+  PAGESIZE: "2048"
+  HEADER_VERSION: "0"
+  CMDLINE: "earlycon console=tty0 loglevel=7"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout kernel
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc bison build-essential cpio flex git libssl-dev libncurses-dev gcc-aarch64-linux-gnu device-tree-compiler mkbootimg wget gzip
+
+      - name: Check devicetree for A02
+        run: |
+          DTS=$(find arch/arm64/boot/dts/qcom -iname '*a02*' -name '*.dts' | head -n1)
+          if [ -z "$DTS" ]; then
+            echo "::error::В этой ветке нет devicetree для A02 (a02q/a02s). Ядро не загрузится на телефоне без него."
+            echo "Samsung-файлы в этой ветке:"
+            ls arch/arm64/boot/dts/qcom | grep -i samsung || true
+            exit 1
+          fi
+          echo "Found DTS: $DTS"
+          echo "DTB=${DTS%.dts}.dtb" >> "$GITHUB_ENV"
+
+      - name: Configure and compile
+        run: |
+          export ARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          if [ -f arch/arm64/configs/msm8953_defconfig ]; then
+            make msm8953_defconfig
+          else
+            make defconfig
+          fi
+          make -j"$(nproc)" Image.gz dtbs modules
+          mkdir -p modules_out
+          make INSTALL_MOD_PATH=modules_out modules_install
+
+      - name: Check DTB was built
+        run: |
+          echo "Expecting: $DTB"
+          test -f "$DTB" || { echo "::error::DTB не собрался: $DTB (проверь Makefile в arch/arm64/boot/dts/qcom)"; exit 1; }
+
+      - name: Build ARM64 initramfs
+        run: |
+          mkdir -p initrd/bin initrd/dev initrd/proc initrd/sys initrd/mnt/root
+          wget -O initrd/bin/busybox https://busybox.net/downloads/binaries/1.31.0-defconfig-multiarch-musl/busybox-armv8l
+          chmod +x initrd/bin/busybox
+          sudo mknod -m 622 initrd/dev/console c 5 1
+          cat > initrd/init << 'EOF'
+          #!/bin/busybox sh
+          /bin/busybox --install -s /bin
+          mount -t proc proc /proc
+          mount -t sysfs sysfs /sys
+          mount -t devtmpfs devtmpfs /dev
+          ROOT=$(sed -n 's/.*root=\([^ ]*\).*/\1/p' /proc/cmdline)
+          if [ -n "$ROOT" ]; then
+            sleep 3
+            mount "$ROOT" /mnt/root && exec switch_root /mnt/root /sbin/init
+          fi
+          echo "root= not set or mount failed, dropping to shell"
+          cat /proc/partitions
+          exec sh
+          EOF
+          chmod +x initrd/init
+          cd initrd && find . | cpio -o -H newc -R 0:0 | gzip > ../initramfs.cpio.gz
+
+      - name: Pack boot.img
+        run: |
+          echo "Using DTB: $DTB"
+          cat arch/arm64/boot/Image.gz "$DTB" > Image.gz-dtb
+          mkbootimg --kernel Image.gz-dtb --ramdisk initramfs.cpio.gz \
+            --base "$BASE" --kernel_offset "$KERNEL_OFFSET" \
+            --ramdisk_offset "$RAMDISK_OFFSET" --tags_offset "$TAGS_OFFSET" \
+            --pagesize "$PAGESIZE" --header_version "$HEADER_VERSION" \
+            --cmdline "$CMDLINE" -o boot-a02q.img
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: a02q-7.1.3
+          path: |
+            boot-a02q.img
+            Image.gz-dtb
+            modules_out/
